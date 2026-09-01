@@ -1,0 +1,896 @@
+---
+name: gh-pr-review-address
+description: >
+  Process open PR review feedback and failing CI checks in the current repo.
+  Triages every review comment and status check failure — auto-fixes unambiguous
+  items and commits directly, discusses judgment calls with the user, and logs
+  out-of-scope feedback as new GitHub issues. Can target a single PR by number
+  or process all open PRs authored by the user. Resolution-aware: reads
+  review-thread state (isResolved/isOutdated) and sticky review verdicts
+  (undismissed CHANGES_REQUESTED) at intake, so already-addressed feedback on
+  long multi-round PRs is not re-surfaced.
+
+  Trigger this skill whenever the user says things like "check my PR feedback",
+  "address my review comments", "what's blocking my PR", "process my PR reviews",
+  "handle PR feedback", "anything blocking merge", "fix my CI failures",
+  "address PR #42", "check PR 15", or any variation of wanting to act on GitHub
+  pull request review comments or failing checks. If the user is in a repo and
+  mentions PRs, reviews, or CI status in any action-oriented way, this skill
+  should activate.
+---
+
+# PR Feedback Processor
+
+## Your role in this skill
+
+You are the **orchestrator**. Your job is to gather information, triage feedback,
+and hand off work to the right specialist agent for each task. Do not write code,
+edit files, or run commits yourself — delegate those actions.
+
+The guiding principle: **if a reviewer raised it and it carries signal, address
+it**. Documentation gaps, missing tests, correctness concerns, and substantive
+style issues are part of the workflow — none of those are beneath fixing.
+
+Two categories don't get acted on this PR:
+
+1. **Nit / cosmetic findings** (see § Suppression filter in Step 3) — skipped
+   to break the unbounded review-fix-review loop. Each fix-up commit
+   re-triggers bot review, which finds more nits, ad infinitum. Suppressing
+   them at intake is the cheapest stop rule. For findings from a **gating
+   bot** — one that blocks its own review verdict until every actionable
+   comment reaches a resolved state, nits included — suppression is paired
+   with a thread reply + resolve so the bot's verdict doesn't stall forever;
+   see § Gating bots: reply + resolve, not fully silent under Step 3.
+2. **Genuinely out-of-scope feedback** — logged as a new GitHub issue rather
+   than dropped.
+
+---
+
+## Step 1 — Identify the repo and target PRs
+
+The user may specify a single PR to process — by number (`#42`, `42`), URL, or
+branch name. If they do, skip the discovery step and target only that PR.
+
+1. Run `git remote get-url origin` to get the current repo's remote URL. Parse the
+   `owner` and `repo` from it (handle both HTTPS and SSH formats).
+2. **If the user specified a PR**: confirm it exists and is open directly:
+   ```bash
+   gh pr view <N> --repo <owner>/<repo> --json number,title,state
+   ```
+3. **If no PR was specified**: identify your open PRs directly:
+   ```bash
+   # Get the authenticated username
+   gh api user --jq .login
+   # List open PRs authored by that user
+   gh pr list --repo <owner>/<repo> --state open --author @me --json number,title,headRefName
+   ```
+4. If there are no matching PRs, tell the user and stop.
+
+---
+
+## Step 2 — Gather feedback for each PR
+
+Fetch the full PR data directly, running these in parallel:
+
+```bash
+# 1. PR details + formal review bodies — title, description, changed files, reviews
+gh pr view <N> --repo <owner>/<repo> --json title,body,files,reviews,state
+
+# 2. Inline review-thread comments (anchored to file + line)
+gh api repos/<owner>/<repo>/pulls/<N>/comments --jq '.[]'
+
+# 3. General PR-conversation comments (SEPARATE source — where bots post)
+gh api repos/<owner>/<repo>/issues/<N>/comments --jq '.[]'
+
+# 4. Mergeable state — fetch the literal value; do not interpret
+gh pr view <N> --repo <owner>/<repo> --json mergeable,mergeStateStatus
+```
+
+For item 4: if `mergeable` is `UNKNOWN`, wait ~5 seconds and re-run that command once. If still `UNKNOWN` after one retry, proceed with `UNKNOWN` noted explicitly — do not interpret it as clean.
+
+These commands return **three distinct finding streams** — keep them as
+separate lists through triage, never merge them into one:
+
+- **Review-body findings** — the `reviews[].body` text from #1 (a reviewer's formal
+  review summary).
+- **Inline findings** — the per-line review-thread comments from #2.
+- **Conversation findings** — the general PR-conversation comments from #3.
+
+**Why #2 and #3 are both required:** `get_pull_request_comments` returns ONLY inline
+review-thread comments (anchored to a file + line). General PR-conversation comments —
+where automated review bots like `claude-action-runner`, `coderabbitai`, and `copilot[bot]`
+post substantial multi-finding reviews — live in the **issue_comments API**, because GitHub
+treats a PR as a special issue sharing the same number (PR # = issue #). Fetching only inline
+comments silently misses these. Treat any review by an automated reviewer as a high-priority
+signal even when it arrives as a single conversation comment.
+
+**Why the formal review body is not canonical:** bot reviewers (Codex, CodeRabbit,
+Copilot) increasingly post their actual findings as **inline comments** (#2) while the
+formal review **body** (#1) carries only a generic "Here are some automated review
+suggestions" preamble — no severity tags, no findings text. **An empty or preamble-only
+review body does NOT mean "no findings"** — the findings are in the inline stream. Never
+let the review-body text gate whether you inspect the inline list; the two streams are
+independent. (Incident: a P1 inline comment was silently dropped because the review body
+was treated as canonical — `glitchwerks/claude-configs` PR #833 / commit `be03d7f`.)
+
+**Determining what's unresolved is a data step, not a guess** — see **Step 2.5**,
+which computes resolution state across three independent axes before triage. Do
+NOT decide "resolved" from the REST comment fetches alone: they carry no
+resolution state, and using them alone makes you re-triage every comment from
+every past round (the exact failure this skill exists to avoid).
+
+### Merge conflicts
+
+The `mergeable` field returned by the Step 2 query above will be `"CONFLICTING"`
+if there are conflicts, `"MERGEABLE"` if clean, or `"UNKNOWN"` if GitHub is still
+computing (the Step 2 instructions already call for a retry once and returning the
+literal `UNKNOWN` rather than interpreting it).
+
+**Sanity check on recently-pushed branches.** GitHub can return a stale or ambiguous
+`mergeable` value on a freshly-pushed branch where the merge computation hasn't finished.
+A false "clean" here leads you to merge a conflicted PR. So when `mergeable` reads clean
+on a recently-pushed branch, verify by running:
+
+```bash
+gh pr view <N> --repo <owner>/<repo> --json mergeable,mergeStateStatus
+```
+
+If `mergeStateStatus` is anything other than `CLEAN` / `HAS_HOOKS` / `UNSTABLE` — especially
+`DIRTY` (conflict), `BLOCKED` (waiting on CI/reviews), or `BEHIND` (out of date with base) —
+treat the earlier mergeable result as suspect and re-triage.
+
+If conflicts exist, flag them as a blocking item for triage in Step 3. Merge
+conflicts are higher priority than review comments — a conflicted PR can't merge
+regardless of review status.
+
+### CI status checks
+
+Also fetch the PR's check suite / status check results. Use
+`gh pr checks <N> --json name,state,conclusion` (there is no MCP equivalent for
+this). Look for any checks with `conclusion` of `failure`, `action_required`,
+or `cancelled`.
+
+For each failing check, capture:
+
+- The check name (e.g. `lint`, `test`, `build`)
+- The failure summary or log URL
+- Enough of the log output to understand what failed (use
+  `gh run view <run-id> --log-failed` to get the relevant log lines)
+
+Failing CI checks are just as blocking as review comments — treat them as
+additional items to triage in the next step.
+
+---
+
+## Step 2.5 — Determine resolution state (3 axes)
+
+Do this **before** triage. The Step 2 REST fetches (`pulls/N/comments`,
+`issues/N/comments`) carry **no resolution state** — used alone they make you
+re-triage every comment from every past round. "Addressed?" is not one signal
+but **three independent axes**. Compute all three, then Step 3 triages only the
+reconciled OPEN set.
+
+Anchor everything to the current head SHA:
+
+```bash
+HEAD_SHA=$(gh pr view <N> --repo <owner>/<repo> --json headRefOid --jq .headRefOid)
+```
+
+### Fetch the raw inputs (Axis A/B/C source data)
+
+```bash
+PY="${CLAUDE_PLUGIN_DATA}/venv/Scripts/python.exe"
+[ -f "$PY" ] || PY="${CLAUDE_PLUGIN_DATA}/venv/bin/python"
+```
+
+`isResolved` / `isOutdated` live ONLY in the GraphQL `reviewThreads` API, never
+in REST. Fetch them, extracting the `nodes` array server-side with `--jq` so
+the dumped file is directly the list the script expects — **not** the full
+response envelope:
+
+```bash
+gh api graphql -f owner=<owner> -f repo=<repo> -F number=<N> --jq \
+  '.data.repository.pullRequest.reviewThreads.nodes' -f query='
+  query($owner:String!,$repo:String!,$number:Int!){
+    repository(owner:$owner,name:$repo){
+      pullRequest(number:$number){
+        reviewThreads(first:100){
+          nodes{
+            id isResolved isOutdated path line originalLine
+            comments(first:20){ nodes{ databaseId author{login} createdAt body } }
+          }
+        }
+      }
+    }
+  }' > .tmp/pr<N>-threads.json
+```
+
+`databaseId` on each comment node is the same value as that comment's REST
+`id` from the Step 2 inline-comments fetch (`pulls/<N>/comments`) — it's the
+join key that lets later steps (§ Gating bots: reply + resolve) match a
+specific suppressed comment to its exact position in a thread, rather than
+guessing from `path`/`line`/`author` alone. `body` is included so the same
+fetch can also detect an existing reply (see § Reply and resolve are
+independently retryable).
+
+Paginate past 100 with the `pageInfo` cursor rather than silently truncating
+(the `--jq` filter above still applies per page; merge the `nodes` arrays
+across pages before writing the file).
+
+Also fetch the PR's commits (with dates), then merge each commit's per-file
+patches into the same record — the resolution-state script needs `files`
+present on every commit object, so this MUST be one merged file, not two
+separate fetches left unjoined:
+
+```bash
+# commits (with dates) on the PR
+gh api repos/<owner>/<repo>/pulls/<N>/commits --jq \
+  '[.[] | {sha:.sha, date:.commit.committer.date}]' > .tmp/pr<N>-commits.json
+# merge each commit's file patches into the same record (loop + python,
+# since jq is not guaranteed on every host)
+"$PY" -c "
+import json, subprocess
+commits = json.load(open('.tmp/pr<N>-commits.json'))
+for c in commits:
+    out = subprocess.run(
+        ['gh', 'api', f'repos/<owner>/<repo>/commits/{c[\"sha\"]}', '--jq',
+         '[.files[] | {filename, patch}]'],
+        capture_output=True, text=True, check=True,
+    )
+    c['files'] = json.loads(out.stdout)
+json.dump(commits, open('.tmp/pr<N>-commits.json', 'w'))
+"
+# reviews
+gh api repos/<owner>/<repo>/pulls/<N>/reviews --jq \
+  '[.[] | {user:{login:.user.login}, state:.state, submitted_at:.submitted_at, commit_id:.commit_id}]' \
+  > .tmp/pr<N>-reviews.json
+```
+
+### Compute the three axes via the script
+
+Do NOT hand-classify threads by reading `isOutdated`/patches/review states
+yourself — `scripts/gh-pr-review-address.py resolution-state` computes all
+three axes deterministically from the fetched JSON:
+
+```bash
+"$PY" -c "
+import json
+threads = json.load(open('.tmp/pr<N>-threads.json'))  # nodes list
+commits = json.load(open('.tmp/pr<N>-commits.json'))   # with files/patch merged in
+reviews = json.load(open('.tmp/pr<N>-reviews.json'))
+print(json.dumps({'threads': threads, 'commits': commits, 'reviews': reviews}))
+" | "$PY" "${CLAUDE_PLUGIN_ROOT}/scripts/gh-pr-review-address.py" resolution-state
+```
+
+It returns one JSON object:
+
+```json
+{
+  "threads": [{"id": "...", "classification": "RESOLVED|CANDIDATE-ADDRESSED|OPEN", "path": "...", "line": 42}],
+  "sticky_blockers": ["<reviewer login>", ...]
+}
+```
+
+**What each classification means** (the script's rules, for reference —
+you don't need to re-derive them, just act on the output):
+
+- `RESOLVED` — `isResolved == true` on the thread. Drop from triage; never
+  re-surface.
+- `CANDIDATE-ADDRESSED` — thread unresolved but `isOutdated == true`, or a
+  commit **after the thread's first comment** touched its `path` near its
+  `line`. Gets a confirming thread reply, not a re-fix.
+- `OPEN` — unresolved and untouched since the comment. Genuinely actionable.
+- `sticky_blockers` — reviewer logins whose latest review is
+  `CHANGES_REQUESTED` with no later `APPROVED` from that same reviewer.
+  **New commits do NOT clear this** — it's the axis the skill historically
+  missed entirely; a PR with every inline thread resolved can still be
+  hard-blocked here. Surface as the top blocking item.
+
+Before weighting a blocking review, verify it targets a commit actually in
+head (not a stale review on an abandoned push) — the script does not fetch
+this itself, check separately:
+
+```bash
+HEAD_SHA=$(gh pr view <N> --repo <owner>/<repo> --json headRefOid --jq .headRefOid)
+gh api repos/<owner>/<repo>/compare/<review_commit>...<HEAD_SHA> --jq .status
+# identical / ahead => review commit is an ancestor of head (current)
+# diverged          => stale review on an abandoned commit; do not weight
+```
+
+### Reconcile and hand off
+
+Counts MUST add up: `total threads = RESOLVED + unresolved`, and
+`unresolved = CANDIDATE-ADDRESSED + OPEN` (the script's per-thread
+`classification` field lets you tally this directly — if a number looks off,
+re-check the input JSON rather than guessing).
+
+The **OPEN set Step 3 triages** = (script-classified `OPEN` threads) ∪
+(un-addressed conversation / review-body findings from Step 2). `RESOLVED`
+and `CANDIDATE-ADDRESSED` threads generate no fix-up work —
+`CANDIDATE-ADDRESSED` gets a confirming reply at most. **`sticky_blockers`
+entries are carried into Step 3 as the highest-priority items.**
+
+This shares the `reviewThreads` query with Step 4.5 but runs at the opposite
+end: Step 2.5 **reads** resolution state to scope triage; Step 4.5 **writes**
+resolution state after fix-up commits land.
+
+---
+
+## Step 3 — Triage each comment and CI failure
+
+Do this yourself — triage is analysis, not implementation.
+
+**Triage only the OPEN set from Step 2.5.** Do not re-triage threads classified
+RESOLVED (Axis A) — re-surfacing already-resolved feedback as new work is the
+exact failure this skill exists to avoid. CANDIDATE-ADDRESSED threads (Axis B)
+get at most a confirming thread reply, not a fix-up commit. **STICKY BLOCKER
+verdicts (Axis C) enter triage as the highest-priority blocking items** even
+when every inline thread is resolved — the PR cannot merge until that reviewer
+re-reviews.
+
+### Iterate every finding stream independently
+
+Triage walks all three Step 2 finding streams — review-body, inline, and
+conversation — and treats each as its own list:
+
+- **Iterate inline comments one at a time.** Each inline comment is a separate
+  finding; do not expect one finding per formal review, and do not roll multiple
+  inline comments up into a single review-level verdict. Every inline comment
+  ends up as its own row in the triage matrix.
+- **An empty or preamble-only review body must NOT short-circuit triage.** If the
+  formal review body (#1) is blank or just a generic preamble, that says nothing
+  about the inline (#2) and conversation (#3) streams — triage those in full
+  regardless. Never use "review body had no findings" as a reason to skip the
+  inline list.
+
+Then apply the **suppression filter first**, then evaluate the surviving items on
+the two axes that follow.
+
+### Suppression filter (apply first)
+
+Skip findings that match any of these patterns. Suppression never generates
+a fix-up commit, and for non-gating bots and all human reviewers it is
+otherwise fully silent — no reply, no resolve. **Findings authored by a
+gating bot are the exception** — see § Gating bots: reply + resolve, not
+fully silent below. Either way, every suppressed item is counted and listed
+in the Step 5 summary so the user can override.
+
+**Bot-specific patterns — run the script, don't pattern-match by hand:**
+
+`scripts/gh-pr-review-address.py suppression-candidates` applies the
+bot-specific lookup table deterministically (`claude-action-runner[bot]`'s
+`findings.low` tier, `coderabbitai[bot]`'s `Nitpick:`/`Nit:` prefix,
+`chatgpt-codex-connector[bot]`'s `P3`-or-lower tag, and
+`copilot-pull-request-reviewer[bot]`'s style-vs-correctness heuristic) so
+you don't re-derive these regexes by eye every run:
+
+```bash
+PY="${CLAUDE_PLUGIN_DATA}/venv/Scripts/python.exe"
+[ -f "$PY" ] || PY="${CLAUDE_PLUGIN_DATA}/venv/bin/python"
+echo '{"comments": [{"comment_id": 1001, "author_login": "coderabbitai[bot]", "body": "..."}]}' \
+  | "$PY" "${CLAUDE_PLUGIN_ROOT}/scripts/gh-pr-review-address.py" suppression-candidates
+```
+
+Feed it the **inline** finding stream (Step 2 item #2) as
+`{"comments": [...]}`, where each comment object has `comment_id`,
+`author_login`, and `body` keys (as in the example above). It returns one
+object per comment with `comment_id`, `author_login`, `suppress_candidate`
+(bool), and `matched_rule` (string, or `null` when not suppressed). Treat
+`suppress_candidate: true` as a strong
+signal, not an auto-suppress — the cross-bot judgment pass below still
+applies on top of it, and a candidate can still be kept if it's actually
+substantive (see "Always keep" below). The script only covers the inline
+stream; conversation-stream findings (Step 2 item #3) have no per-comment
+`comment_id` to feed it and go straight to the cross-bot judgment pass.
+
+**Cross-bot pattern (apply to any review source, including human reviews):**
+
+Suppress findings that are _purely cosmetic_ — i.e. the reviewer would accept
+either form as correct, and the change has no impact on behavior, correctness,
+performance, or security. Concrete examples that get suppressed:
+
+- Pure formatting preferences not enforced by the project's formatter
+- Naming preferences where both forms are idiomatic
+- Comment wording tweaks ("could be clearer", "consider rephrasing")
+- Re-ordering imports / fields when project has no rule
+- Choice of equivalent stdlib functions (`x.append(y)` vs `x += [y]`)
+
+**Always keep (never suppress), regardless of how the bot tagged it:**
+
+- Anything Medium severity or above
+- Anything naming a real bug, incorrect behavior, or broken assumption
+- Security findings of any severity
+- Performance concerns of any severity
+- Findings about missing tests, missing error handling, or unhandled edge cases
+- Findings the project's formatter/linter would flag (those are correctness in
+  this codebase, not style)
+- Documentation gaps that affect a user-facing surface (README, public docstring)
+
+**When in doubt:** keep the finding. The cost of one extra fix-up commit is
+lower than the cost of shipping a real issue past review because it was
+tagged "nit."
+
+### Gating bots: reply + resolve, not fully silent
+
+Some bots gate their own review verdict on **all** actionable comments
+reaching a resolved state — including ones the bot itself tagged
+nit/trivial. `coderabbitai[bot]` is the confirmed case: it holds
+`CHANGES_REQUESTED` open until every thread it opened is resolved,
+regardless of the severity it assigned. A finding suppressed above but
+never resolved leaves that thread open forever from the bot's point of
+view — it has no way to know the skip was intentional, so its verdict
+never clears even after every substantive finding is fixed and pushed.
+Root-caused on `glitchwerks/claude-configs` PR #1106 (2026-07-18): a
+suppressed "add subprocess timeout" nit, left unresolved, alone kept
+`mergeStateStatus: BLOCKED` for ~35 minutes with no re-review.
+
+**Gating bot set:** a subset of Step 4.5's bot allow-list (§ Bot
+allow-list) — reuse that same allow-list mechanism rather than maintaining
+a second list, but do not assume every member gates. Seed the gating set
+with just `coderabbitai[bot]`, the only member with confirmed
+gate-on-full-resolution behavior (#1106). Add another allow-listed bot to
+the gating set only once it's confirmed to behave the same way — an
+unconfirmed bot stays covered by the ordinary "suppress and leave open"
+path below, so "never force-resolve nits from a non-gating bot" (a few
+paragraphs down) still has teeth for `chatgpt-codex-connector[bot]` and
+`copilot-pull-request-reviewer[bot]` until each is individually confirmed.
+
+**Scope: inline findings only.** This path resolves a GraphQL review
+*thread*, so it only applies to suppressed findings from the **inline**
+stream (Step 2 item #2), which are anchored to a thread. Suppressed
+findings from the **conversation** stream (Step 2 item #3 — where a bot's
+multi-finding summary posts as an issue comment) have no thread to resolve
+and always land in the ordinary "suppress and leave open" bucket,
+regardless of the bot that authored them.
+
+**Correlating a suppressed finding to its thread.** `(path, line, author)` is
+not a unique key: a thread can hold comments from more than one author (a
+human's opening comment followed by a bot's later nit, or the reverse), and a
+single file/line can carry more than one distinct finding from the same bot.
+Matching on that triple risks attaching the reply to the wrong comment.
+Instead, carry forward the identifiers you already have at the moment a
+finding is suppressed in Step 3:
+
+- the suppressed comment's own REST `id` (`comment_id`), from the Step 2
+  inline-comments fetch (`pulls/<N>/comments`)
+- that comment's author login — the login the suppression filter actually
+  matched against, not necessarily the thread's first comment's author
+- the enclosing thread's GraphQL node `id`, found by matching `comment_id`
+  against a comment node's `databaseId` in the Step 2.5 Axis A fetch
+  (`databaseId` is the same value as the REST comment `id` — the join key
+  between the two APIs)
+
+Gating-bot authorship is checked on **this specific suppressed comment**,
+never on the thread's first comment — a thread mixing a human's comment with
+a bot's nit (or the reverse) must not have the wrong one decide whether the
+gating path fires.
+
+For each inline finding suppressed above whose specific comment's author is
+in the gating set:
+
+1. **Reply** on the same thread (not a top-level PR conversation comment —
+   it must attach to the thread the bot is gating on) explaining the skip:
+
+   ```bash
+   gh api repos/<owner>/<repo>/pulls/<N>/comments/<comment_id>/replies \
+     -f body='Suppressed as cosmetic/nit per project convention — not applying this suggestion.'
+   ```
+
+   `<comment_id>` is the specific suppressed comment's REST id, carried
+   forward from Step 3 as described above — not the thread's first comment.
+   **Before posting, check for an existing reply first** — see § Reply and
+   resolve are independently retryable below; skip straight to step 2 if one
+   is already there.
+
+2. **Resolve** the thread via the same `resolveReviewThread` GraphQL
+   mutation documented in Step 4.5 § Procedure, step 3, using the thread's
+   GraphQL node id carried forward from Step 3. Only run this once the reply
+   is confirmed present (either just posted, or found already there).
+
+### Reply and resolve are independently retryable
+
+The reply and the resolve are two separate writes; either can fail without
+the other. If the reply succeeds but the `resolveReviewThread` mutation
+fails (network blip, API error), nothing marks the reply as already posted —
+a naive retry on a later run would post a **second, duplicate reply** before
+attempting resolve again.
+
+Guard against this explicitly:
+
+- **Before posting a reply**, check whether a reply from this skill already
+  exists on the thread — look for a comment whose `body` matches the
+  suppression-reply text above among the thread's comments (the `body` field
+  added to the Step 2.5 Axis A fetch covers this, or fall back to a fresh
+  `pulls/<N>/comments` filtered to `in_reply_to_id == <comment_id>`). If one
+  already exists, do not post again — go straight to resolve.
+- **Only resolve once the reply is confirmed present.**
+- Track the two writes as independent outcomes so Step 5 can report the
+  right state per finding: both landed → `[resolved]`; reply landed but
+  resolve did not → `[pending]` (retry resolve-only next run); the reply
+  itself did not land → `[failed]` (retry from the reply step next run).
+
+**Step 3 only decides which suppressed findings qualify.** The reply and
+resolve above are write actions, not analysis — they execute after triage
+completes, at the same point Step 4.5 runs (whether or not Step 4.5 itself
+has any Mode A/B fix-detected threads to process), not during this Step 3
+pass. This keeps Step 3 itself read-only, consistent with "triage is
+analysis, not implementation" above and "do not write code, edit files, or
+run commits yourself" in § Your role in this skill.
+
+**This is a separate path from Step 4.5's Mode A/B resolution**, not a
+variant of it. Mode A/B resolves a thread because a landed commit fixed the
+finding (`isOutdated`-driven). This path resolves a thread because the
+finding was *never going to be fixed* and the bot needs to see that decision
+made explicit. Keep the two apart in bookkeeping — Step 5 reports them on
+separate lines (see Step 5 below).
+
+**Do not force-resolve nits from a bot that is not in the gating set, or
+from a human reviewer.** Only gating-bot-authored inline threads get the
+reply+resolve treatment; everything else suppressed above stays untouched —
+this matches Step 4.5's existing rule against ever resolving a
+human-authored thread.
+
+#### Worked example
+
+1. CodeRabbit posts two separate inline nits on the same line,
+   `scripts/run.py:42`, in the same thread: comment `1001` ("Nitpick:
+   consider extracting this into a helper function") and comment `1002`
+   ("Nit: rename `tmp` to `buffer`") — both authored by `coderabbitai[bot]`.
+2. The suppression filter above matches both (`Nitpick:` / `Nit:` prefix,
+   CodeRabbit's bot-specific-patterns row) — no fix-up commit is generated
+   for either. Each carries forward its own `comment_id` (`1001`, `1002`)
+   and author login, plus the shared thread's GraphQL node id (matched via
+   `databaseId`).
+3. `coderabbitai[bot]` is in the gating set, so the reply+resolve path fires
+   once triage is done, once per suppressed comment: reply on `1001` via
+   `.../comments/1001/replies`, reply on `1002` via `.../comments/1002/replies`
+   — each checked first for an existing reply — then `resolveReviewThread`
+   once on the shared thread's node id (a second resolve call on an
+   already-resolved thread is a no-op).
+4. The Step 5 summary lists both as `[resolved]` under the suppressed-findings
+   line, not `[left open]`.
+5. On the next run of this skill (or the next review round), Step 2.5 Axis A
+   sees `isResolved == true` for that thread — it drops out of the
+   unresolved set and is never re-triaged.
+
+### In scope or out of scope?
+
+The PR has a stated purpose from its title and description. Feedback is **out of
+scope** if it addresses something genuinely unrelated to that purpose — a different
+system, pre-existing code the PR didn't touch, or a separate feature entirely.
+
+Feedback is **in scope** if it relates to any code, documentation, or behavior
+introduced or touched by this PR — even if the comment feels minor.
+
+### Auto-fixable or needs discussion?
+
+**Auto-fixable** — the fix is unambiguous and can be delegated with confidence:
+
+- Typos or grammar in comments, docs, or strings
+- Missing or incomplete docstrings/comments
+- A specific variable rename the reviewer called out
+- A null/bounds check the reviewer explicitly requested
+- Formatting or style that deviates from the codebase convention
+- README or changelog updates
+- **CI failures with clear errors** — lint violations, type errors, failing tests
+  where the log output points to a specific file and line
+
+**Needs discussion** — requires a judgment call before delegating:
+
+- Architectural trade-offs
+- Ambiguous reviewer intent ("this feels off" without a clear direction)
+- Changes that would affect other callers or downstream behavior
+- Anything where getting it wrong would introduce a bug
+- **CI failures with ambiguous causes** — flaky tests, environment issues,
+  failures where the root cause isn't obvious from the logs
+
+When uncertain whether something is auto-fixable, default to discussing it rather
+than guessing.
+
+---
+
+## Step 4 — Take action via delegation
+
+Process in this order: merge conflicts first (nothing else matters if the PR
+can't merge), then CI failures (they often block everything else), then
+auto-fixable review comments, then discussion items, then out-of-scope items.
+
+### Merge conflicts → delegate to `debugger`
+
+If the PR has merge conflicts, spawn a **`debugger`** agent with:
+
+- The PR number and branch name
+- The base branch (usually `main`)
+- Instruction to merge the base branch into the PR branch, resolve conflicts,
+  and push the result
+- The list of files changed in the PR (so the agent understands intent when
+  resolving conflicts)
+
+If the conflicts are complex (touching the same logic in multiple places, or
+conflicting with a large refactor on the base branch), present the conflict
+summary to the user first and confirm the resolution strategy before delegating.
+
+### CI failures → delegate to `debugger`
+
+For each failing check with a clear error, spawn a **`debugger`** agent with:
+
+- The PR number and branch name
+- The check name and its failure output (paste the relevant log lines)
+- The list of files changed in the PR (to scope the investigation)
+- Instruction to fix the issue and push to the PR branch
+
+For CI failures that need discussion (ambiguous cause, flaky tests, environment
+issues), present them to the user the same way you would a review comment that
+needs discussion — show the failure, explain what you see, propose an approach,
+and wait for confirmation before delegating.
+
+### Auto-fixable review items → delegate to `code-writer`
+
+Spawn a **`code-writer`** agent with a precise brief that includes:
+
+- The PR number and branch name
+- Each file to change and exactly what to change (quote the review comment)
+- The commit message to use:
+
+  ```
+  review: address PR #N feedback
+
+  - fix typo in UserService.validate() comment
+  - add null check in parseConfig() per review
+  - update README with new env var
+  ```
+
+- Instruction to push to the PR branch when done
+
+Report the commit hash back to the user once the agent completes.
+
+If the fix is a pure bug (incorrect behavior, not just a code style issue),
+spawn a **`debugger`** agent instead.
+
+### Items needing discussion → present to user, then delegate
+
+For each one, present it clearly:
+
+- Quote the review comment verbatim
+- State the file and line it refers to
+- Describe the trade-offs or ambiguity
+- Propose a specific approach
+
+Wait for the user to confirm or redirect. Once confirmed, delegate to `code-writer`
+(or `debugger`) exactly as above with the agreed approach.
+
+### Out-of-scope items → use `gh-create-issue` skill
+
+For each out-of-scope item:
+
+1. Run a duplicate check directly to avoid creating duplicate issues:
+   ```bash
+   gh issue list --repo <owner>/<repo> --search '<keywords>' --state all --json number,title,state
+   ```
+2. If a related issue exists, note it and move on.
+3. If none exists, invoke the **`gh-create-issue` skill** to create a well-formed
+   issue. Include in the brief: what the reviewer said, why it's deferred from this
+   PR, and the relevant PR number for context.
+4. Tell the user which issue was created or already existed.
+
+---
+
+## Step 4.5 — Resolve addressed bot review threads
+
+Run this **only after Step 4 fix-up commits have actually landed** on the PR
+branch. GitHub does not auto-resolve review threads when the addressing code
+lands — threads can be marked **Outdated** (when their anchor lines move) but
+only a human or bot can flip them to **Resolved**. Left alone, addressed
+threads stay "Open" in the PR UI, the "Files changed" tab keeps flagging
+conversations that are actually handled, and branch-protection rules that gate
+on "all conversations resolved" can't be satisfied without manual clicks.
+
+If no fix-up commits were pushed (everything was suppressed, out-of-scope, or
+pending discussion), **skip this step** — there is nothing left for *this*
+step to mark resolved.
+
+**This step is not the only path that resolves threads.** Step 3's
+suppression filter has its own independent resolve trigger for gating-bot
+nits (§ Gating bots: reply + resolve, not fully silent) that fires whether
+or not any fix-up commit landed — see that section for the reply-then-resolve
+procedure. Everything below in this step (Mode A/B) covers only threads
+resolved because a fix was actually detected in a landed commit.
+
+### Two modes
+
+| Mode               | Resolves                                                              | Default     |
+| ------------------ | -------------------------------------------------------------------- | ----------- |
+| **B (conservative)** | Unresolved bot threads where `isOutdated == true`                  | ✅ default  |
+| **A (aggressive)**   | All unresolved bot threads, regardless of `isOutdated`            | opt-in only |
+
+**Default to Mode B.** Mode B combines two independent signals — GitHub already
+flagged the thread's anchor as moved (`isOutdated`) **and** the skill just pushed
+a fix addressing it — which together give strong confidence the resolution is
+correct. Only run Mode A when the user explicitly asks (a flag or a follow-up
+prompt), since it resolves threads GitHub has not yet flagged as outdated.
+
+### Bot allow-list
+
+Only ever resolve threads authored by a configured **review bot**. The
+default allow-list (`_DEFAULT_BOT_ALLOWLIST` in the script):
+
+- `chatgpt-codex-connector[bot]`
+- `claude-action-runner[bot]`
+- `coderabbitai[bot]`
+- `copilot-pull-request-reviewer[bot]`
+
+The resolver allow-list matches Step 3's suppression set, so suppressed
+findings from those review bots can also be auto-resolved via Step 4.5.
+
+The allow-list is configurable at the function level
+(`filter_resolvable_threads`'s `bot_allowlist` parameter) and through the
+CLI's `--bot-allowlist` flag. Pass comma-separated logins; a supplied list
+overrides rather than extends the default. **Never resolve a thread authored
+by a non-bot (human) reviewer**, in either mode.
+
+### Procedure
+
+1. **Enumerate** the PR's review threads with their resolution state, outdated
+   flag, and first-comment author:
+
+   ```bash
+   gh api graphql -F owner=<owner> -F repo=<repo> -F number=<N> --jq \
+     '.data.repository.pullRequest.reviewThreads.nodes[]' -f query='
+     query($owner:String!, $repo:String!, $number:Int!) {
+       repository(owner:$owner, name:$repo) {
+         pullRequest(number:$number) {
+           reviewThreads(first:100) {
+             nodes {
+               id
+               isResolved
+               isOutdated
+               comments(first:1) { nodes { author { login } } }
+             }
+           }
+         }
+       }
+     }'
+   ```
+
+   If the PR has more than 100 review threads, paginate with the `pageInfo`
+   cursor rather than silently processing only the first page.
+
+2. **Filter** — pipe the raw `nodes[]` array into
+   `scripts/gh-pr-review-address.py resolvable-threads` instead of
+   hand-checking `isResolved`/`isOutdated`/author per thread:
+
+   ```bash
+   PY="${CLAUDE_PLUGIN_DATA}/venv/Scripts/python.exe"
+   [ -f "$PY" ] || PY="${CLAUDE_PLUGIN_DATA}/venv/bin/python"
+   echo "{\"threads\": $THREAD_NODES_JSON}" \
+     | "$PY" "${CLAUDE_PLUGIN_ROOT}/scripts/gh-pr-review-address.py" \
+       resolvable-threads --mode B
+   ```
+
+   `$THREAD_NODES_JSON` is the `nodes[]` array from step 1, unmodified (each
+   node already carries `id`, `isResolved`, `isOutdated`, and
+   `comments.nodes[0].author.login` — the exact shape the script expects).
+   Pass `--mode A` only when the user explicitly asked for the aggressive
+   mode. The script applies the same three conditions as before
+   (`isResolved == false`, first-comment author in the bot allow-list —
+   default list matches Step 3's — and, Mode B only, `isOutdated == true`)
+   and returns `{"resolvable_thread_ids": [...]}`.
+
+3. **Resolve** each surviving thread by its node `id`:
+
+   ```bash
+   gh api graphql -F threadId="<THREAD_NODE_ID>" -f query='
+     mutation($threadId:ID!) {
+       resolveReviewThread(input:{threadId:$threadId}) {
+         thread { isResolved }
+       }
+     }'
+   ```
+
+   Confirm the mutation returns `isResolved: true` for each.
+
+### Out of scope (do not attempt here)
+
+- Resolving threads that already have **bot replies** (e.g. a CodeRabbit
+  "fixed in commit X" follow-up) — those need their own resolution heuristic.
+- **Auto-replying** to threads with the fix-up commit SHA — separate
+  enhancement. (The suppression-driven reply in Step 3 § Gating bots: reply
+  + resolve is a different, already-sanctioned path — it explains a skip,
+  not a fix, and only fires for gating-bot inline nits.)
+
+---
+
+## PR body / comment body patterns
+
+When pushing a fresh PR body, comment, or release notes via `gh pr create`,
+`gh pr edit`, `gh issue create`, or `gh release create`, use a single-quoted
+HEREDOC fed through command substitution:
+
+```bash
+gh pr create --title "fix: handle stale rollup" --body "$(cat <<'EOF'
+## Summary
+
+- One bullet per discrete change
+- Use the body for detail, the title stays short (<70 chars)
+
+## Test plan
+
+- [ ] Lint clean
+- [ ] Tests green
+
+Closes #123
+
+🤖 *Generated by Claude Code*
+EOF
+)"
+```
+
+Rules:
+
+- **Closing `EOF` and `)"` MUST be at column zero.** Indented closing markers
+  are a shell parse error, not a content issue — there is no error message
+  pointing at the indent; the body just turns into garbled output.
+- **Use single-quoted `<<'EOF'`** (not `<<EOF`). Single quotes suppress
+  `$variable` and `$(cmd)` expansion inside the body. With unquoted `EOF`,
+  any `$(date)` / `$VAR` mention in the prose runs as a command — silently
+  corrupting the body or, worse, executing arbitrary substitutions.
+- **For payloads above ~30 KB**, do NOT use the HEREDOC pattern. Write the
+  body to `.tmp/<scratch>.md` and pass `--body-file <path>` instead — or for
+  raw `gh api` calls, `--input <payload.json>`. The HEREDOC route is for
+  human-readable PR/issue bodies, not arbitrary large payloads.
+- **PowerShell users**: this is a bash-only pattern. The PowerShell equivalent
+  is `gh ... --body-file <path>` after writing the body via `Out-File`. Avoid
+  `Set-Content -NoNewline` — it can corrupt multi-line bodies on Windows.
+
+---
+
+## Step 5 — Summary
+
+After all PRs are processed, give the user a concise recap:
+
+- Which PRs were checked
+- **Resolution-state recap (Step 2.5)** — one line per PR:
+  `N threads: X resolved, Y candidate-addressed, Z open; sticky blockers: <reviewer(s)> or none.`
+  Counts must reconcile. This makes explicit that resolved history was NOT
+  re-triaged, and names any sticky `CHANGES_REQUESTED` verdict as the true blocker.
+- Whether merge conflicts were resolved (and how)
+- What CI failures were fixed (check name + what was wrong)
+- What review comments were auto-fixed (commit hash and bullet list of changes),
+  reported under **two separate headings** so the user sees what was triaged in
+  each category:
+  - **Review-body findings** — items drawn from formal review summaries
+  - **Inline findings** — items drawn from per-line review-thread comments
+    (also note the count, so an inline-only review is visibly accounted for)
+- What was discussed and how it was resolved
+- What issues were created for deferred items
+- **Review threads resolved in Step 4.5** — one line:
+  "Resolved N of M bot review threads (X were not yet outdated; skipped)."
+  Omit this line if Step 4.5 was skipped (no fix-up commits landed). This
+  count is Mode A/B (fix-detected) resolutions only — gating-bot suppression
+  resolutions are reported separately, in the line below.
+- **Findings suppressed by the Step 3 nit/cosmetic filter** — one line per
+  suppression with the bot, the file/line ref, and a 6-8 word summary, so
+  the user can spot any that should have been kept and ask for them to be
+  re-included. Tag each line with its resolution outcome so the buckets from
+  § Gating bots: reply + resolve are distinguishable at a glance:
+  - `[resolved]` — inline finding from a gating-set bot: reply confirmed
+    posted and thread resolved via the `resolveReviewThread` GraphQL mutation
+  - `[pending]` — inline finding from a gating-set bot: reply confirmed
+    posted, but the resolve mutation has not yet succeeded (see § Reply and
+    resolve are independently retryable) — will retry resolve-only next run
+  - `[failed]` — inline finding from a gating-set bot: the reply write
+    itself did not succeed — will retry from the reply step next run
+  - `[left open]` — everything else: non-gating-set bot, human reviewer, or
+    a conversation-stream finding (no thread exists to resolve) — untouched
+- Anything still pending user input
+
+Keep the summary scannable — the user should be able to confirm everything was
+handled at a glance.
+
+---
+
+## Long-Form Artifact Discipline
+
+When the Step 3 triage produces more than ~5 items, or when fetched review-bot output is substantial (CodeRabbit / Copilot reviews routinely exceed 40 lines), save the triage matrix and the raw review-bot output to `<repo>/.tmp/<YYYY-MM-DD>-pr<N>-triage.md` before delegating in Step 4. The chat reply lists item counts by category (auto-fixable / discussion / out-of-scope), names the top blocker, and points to the file. For the Step 5 final summary, the same discipline applies — save the recap if it would exceed 40 lines.
+
+Write long artifacts to `.tmp/<name>.md` under the repo root rather than inlining them in chat. Pass them to `gh` commands via `--body-file <path>`. This keeps the conversation scannable and sidesteps shell-escaping and encoding problems with large strings.
